@@ -22,6 +22,7 @@
 import {
     Callable,
     calculateDimensions,
+    calculateReflectOffset,
 } from './utils/core.js';
 
 import {
@@ -31,7 +32,7 @@ import {
 import {
     max,
     softmax,
-    FFT
+    FFT,
 } from './utils/maths.js';
 
 
@@ -40,6 +41,91 @@ import { Tensor, transpose, cat, interpolate } from './utils/tensor.js';
 import { RawImage } from './utils/image.js';
 import { getMelFilters } from './utils/audio.js';
 
+
+// Helper functions
+
+/**
+ * Converts bounding boxes from center format to corners format.
+ * 
+ * @param {number[]} arr The coordinate for the center of the box and its width, height dimensions (center_x, center_y, width, height)
+ * @returns {number[]} The coodinates for the top-left and bottom-right corners of the box (top_left_x, top_left_y, bottom_right_x, bottom_right_y)
+ */
+function center_to_corners_format([centerX, centerY, width, height]) {
+    return [
+        centerX - width / 2,
+        centerY - height / 2,
+        centerX + width / 2,
+        centerY + height / 2
+    ];
+}
+
+/**
+ * Post-processes the outputs of the model (for object detection).
+ * @param {Object} outputs The outputs of the model that must be post-processed
+ * @param {Tensor} outputs.logits The logits
+ * @param {Tensor} outputs.pred_boxes The predicted boxes.
+ * @return {Object[]} An array of objects containing the post-processed outputs.
+ */
+function post_process_object_detection(outputs, threshold = 0.5, target_sizes = null) {
+    const out_logits = outputs.logits;
+    const out_bbox = outputs.pred_boxes;
+    const [batch_size, num_boxes, num_classes] = out_logits.dims;
+
+    if (target_sizes !== null && target_sizes.length !== batch_size) {
+        throw Error("Make sure that you pass in as many target sizes as the batch dimension of the logits")
+    }
+    let toReturn = [];
+    for (let i = 0; i < batch_size; ++i) {
+        let target_size = target_sizes !== null ? target_sizes[i] : null;
+        let info = {
+            boxes: [],
+            classes: [],
+            scores: []
+        }
+        let logits = out_logits[i];
+        let bbox = out_bbox[i];
+
+        for (let j = 0; j < num_boxes; ++j) {
+            let logit = logits[j];
+
+            // Get most probable class
+            let maxIndex = max(logit.data)[1];
+
+            if (maxIndex === num_classes - 1) {
+                // This is the background class, skip it
+                continue;
+            }
+
+            // Compute softmax over classes
+            let probs = softmax(logit.data);
+
+            let score = probs[maxIndex];
+            if (score > threshold) {
+                // Some class has a high enough probability
+                /** @type {number[]} */
+                let box = bbox[j].data;
+
+                // convert to [x0, y0, x1, y1] format
+                box = center_to_corners_format(box)
+                if (target_size !== null) {
+                    box = box.map((x, i) => x * target_size[(i + 1) % 2])
+                }
+
+                info.boxes.push(box);
+                info.classes.push(maxIndex);
+                info.scores.push(score);
+            }
+        }
+        toReturn.push(info);
+    }
+    return toReturn;
+}
+
+/**
+ * Named tuple to indicate the order we are using is (height x width), even though
+ * the Graphics’ industry standard is (width x height).
+ * @typedef {[height: number, width: number]} HeightWidth
+ */
 
 /**
  * Base class for feature extractors.
@@ -57,6 +143,13 @@ export class FeatureExtractor extends Callable {
         this.config = config
     }
 }
+
+/**
+ * @typedef {object} ImageFeatureExtractorResult
+ * @property {Tensor} pixel_values The pixel values of the batched preprocessed images.
+ * @property {HeightWidth[]} original_sizes Array of two-dimensional tuples like [[480, 640]].
+ * @property {HeightWidth[]} reshaped_input_sizes Array of two-dimensional tuples like [[1000, 1330]].
+ */
 
 /**
  * Feature extractor for image models.
@@ -90,6 +183,7 @@ export class ImageFeatureExtractor extends FeatureExtractor {
         this.do_normalize = this.config.do_normalize;
 
         this.do_resize = this.config.do_resize;
+        this.do_thumbnail = this.config.do_thumbnail;
         this.size = this.config.size;
 
         this.do_center_crop = this.config.do_center_crop;
@@ -97,14 +191,141 @@ export class ImageFeatureExtractor extends FeatureExtractor {
         this.do_convert_rgb = this.config.do_convert_rgb ?? true;
 
         this.pad_size = this.config.pad_size;
-        this.do_pad = (this.config.do_pad ?? false) && this.pad_size;
+        this.do_pad = this.config.do_pad;
+
+        if (this.do_pad && !this.pad_size && this.size.width !== undefined && this.size.height !== undefined) {
+            // Should pad, but no pad size specified
+            // We infer the pad size from the resize size
+            this.pad_size = this.size
+        }
     }
+
+    /**
+     * Resize the image to make a thumbnail. The image is resized so that no dimension is larger than any
+     * corresponding dimension of the specified size.
+     * @param {RawImage} image The image to be resized.
+     * @param {{height:number, width:number}} size The size `{"height": h, "width": w}` to resize the image to.
+     * @param {string | 0 | 1 | 2 | 3 | 4 | 5} [resample=2] The resampling filter to use.
+     * @returns {Promise<RawImage>} The resized image.
+     */
+    async thumbnail(image, size, resample = 2) {
+        const input_height = image.height;
+        const input_width = image.width;
+
+        const output_height = size.height;
+        const output_width = size.width;
+
+        // We always resize to the smallest of either the input or output size.
+        let height = Math.min(input_height, output_height)
+        let width = Math.min(input_width, output_width)
+
+        if (height === input_height && width === input_width) {
+            return image;
+        }
+        if (input_height > input_width) {
+            width = Math.floor(input_width * height / input_height);
+        } else if (input_width > input_height) {
+            height = Math.floor(input_height * width / input_width);
+        }
+        return await image.resize(width, height, { resample });
+    }
+
+
+    /**
+     * Pad the image by a certain amount.
+     * @param {Float32Array} pixelData The pixel data to pad.
+     * @param {number[]} imgDims The dimensions of the image.
+     * @param {{width:number; height:number}|number} padSize The dimensions of the padded image.
+     * @param {Object} options The options for padding.
+     * @param {'constant'|'symmetric'} [options.mode='constant'] The type of padding to add.
+     * @param {boolean} [options.center=false] Whether to center the image.
+     * @param {number} [options.constant_values=0] The constant value to use for padding.
+     * @returns {[Float32Array, number[]]} The padded pixel data and image dimensions.
+     */
+    pad_image(pixelData, imgDims, padSize, {
+        mode = 'constant',
+        center = false,
+        constant_values = 0,
+    } = {}) {
+        const [imageWidth, imageHeight, imageChannels] = imgDims;
+
+        let paddedImageWidth, paddedImageHeight;
+        if (typeof padSize === 'number') {
+            paddedImageWidth = padSize;
+            paddedImageHeight = padSize;
+        } else {
+            paddedImageWidth = padSize.width;
+            paddedImageHeight = padSize.height;
+        }
+
+        // Only add padding if there is a difference in size
+        if (paddedImageWidth !== imageWidth || paddedImageHeight !== imageHeight) {
+            const paddedPixelData = new Float32Array(paddedImageWidth * paddedImageHeight * imageChannels);
+            if (constant_values !== 0) {
+                paddedPixelData.fill(constant_values);
+            }
+
+            const [left, top] = center
+                ? [Math.floor((paddedImageWidth - imageWidth) / 2), Math.floor((paddedImageHeight - imageHeight) / 2)]
+                : [0, 0];
+
+            // Copy the original image into the padded image
+            for (let i = 0; i < imageHeight; ++i) {
+                const a = (i + top) * paddedImageWidth;
+                const b = i * imageWidth;
+                for (let j = 0; j < imageWidth; ++j) {
+                    const c = (a + j + left) * imageChannels;
+                    const d = (b + j) * imageChannels;
+                    for (let k = 0; k < imageChannels; ++k) {
+                        paddedPixelData[c + k] = pixelData[d + k];
+                    }
+                }
+            }
+
+            if (mode === 'symmetric') {
+                if (center) {
+                    throw new Error('`center` padding is not supported when `mode` is set to `symmetric`.');
+                    // TODO: Implement this
+                }
+                const h1 = imageHeight - 1;
+                const w1 = imageWidth - 1;
+                for (let i = 0; i < paddedImageHeight; ++i) {
+                    const a = i * paddedImageWidth;
+                    const b = calculateReflectOffset(i, h1) * imageWidth;
+
+                    for (let j = 0; j < paddedImageWidth; ++j) {
+                        if (i < imageHeight && j < imageWidth) continue; // Do not overwrite original image
+                        const c = (a + j) * imageChannels;
+                        const d = (b + calculateReflectOffset(j, w1)) * imageChannels;
+
+                        // Copy channel-wise
+                        for (let k = 0; k < imageChannels; ++k) {
+                            paddedPixelData[c + k] = pixelData[d + k];
+                        }
+                    }
+                }
+            }
+
+
+            // Update pixel data and image dimensions
+            pixelData = paddedPixelData;
+            imgDims = [paddedImageHeight, paddedImageWidth, imageChannels]
+        }
+        return [pixelData, imgDims];
+    }
+
+    /**
+     * @typedef {object} PreprocessedImage
+     * @property {HeightWidth} original_size The original size of the image.
+     * @property {HeightWidth} reshaped_input_size The reshaped input size of the image.
+     * @property {Tensor} pixel_values The pixel values of the preprocessed image.
+     */
 
     /**
      * Preprocesses the given image.
      *
      * @param {RawImage} image The image to preprocess.
-     * @returns {Promise<any>} The preprocessed image as a Tensor.
+     * @returns {Promise<PreprocessedImage>} The preprocessed image.
      */
     async preprocess(image) {
 
@@ -127,8 +348,13 @@ export class ImageFeatureExtractor extends FeatureExtractor {
             let shortest_edge;
             let longest_edge;
 
+            if (this.do_thumbnail) {
+                // NOTE: custom logic for `Donut` models
+                const { height, width } = this.size;
+                shortest_edge = Math.min(height, width)
+            }
             // Support both formats for backwards compatibility
-            if (Number.isInteger(this.size)) {
+            else if (Number.isInteger(this.size)) {
                 shortest_edge = this.size;
                 longest_edge = this.config.max_size ?? shortest_edge;
 
@@ -156,9 +382,9 @@ export class ImageFeatureExtractor extends FeatureExtractor {
                     ? 1 // If `longest_edge` is not set, don't downscale
                     : Math.min(longest_edge / newWidth, longest_edge / newHeight);
 
-                // To avoid certain floating point precision issues, we round to 3 decimal places
-                const finalWidth = Math.floor(Number((newWidth * longResizeFactor).toPrecision(3)));
-                const finalHeight = Math.floor(Number((newHeight * longResizeFactor).toPrecision(3)));
+                // To avoid certain floating point precision issues, we round to 2 decimal places
+                const finalWidth = Math.floor(Number((newWidth * longResizeFactor).toFixed(2)));
+                const finalHeight = Math.floor(Number((newHeight * longResizeFactor).toFixed(2)));
 
                 // Perform resize
                 image = await image.resize(finalWidth, finalHeight, {
@@ -173,6 +399,11 @@ export class ImageFeatureExtractor extends FeatureExtractor {
             } else {
                 throw new Error(`Could not resize image due to unsupported \`this.size\` option in config: ${JSON.stringify(this.size)}`);
             }
+        }
+
+        // Resize the image using thumbnail method.
+        if (this.do_thumbnail) {
+            image = await this.thumbnail(image, this.size, this.resample);
         }
 
         if (this.do_center_crop) {
@@ -190,19 +421,11 @@ export class ImageFeatureExtractor extends FeatureExtractor {
             image = await image.center_crop(crop_width, crop_height);
         }
 
+        /** @type {HeightWidth} */
         let reshaped_input_size = [image.height, image.width];
 
-        // TODO is it okay to pad before rescaling/normalizing?
-        if (this.do_pad) {
-            let left = 0;
-            let right = this.pad_size.width - image.width;
-            let top = 0;
-            let bottom = this.pad_size.height - image.height;
-
-            image = await image.pad([left, right, top, bottom]);
-        }
-
-        const pixelData = Float32Array.from(image.data);
+        let pixelData = Float32Array.from(image.data);
+        let imgDims = [image.height, image.width, image.channels];
 
         if (this.do_rescale) {
             for (let i = 0; i < pixelData.length; ++i) {
@@ -232,10 +455,17 @@ export class ImageFeatureExtractor extends FeatureExtractor {
             }
         }
 
+        // do padding after rescaling/normalizing
+        if (this.do_pad && this.pad_size) {
+            const padded = this.pad_image(pixelData, [image.width, image.height, image.channels], this.pad_size);
+            [pixelData, imgDims] = padded; // Update pixel data and image dimensions
+        }
+
+        // Create HWC tensor
+        const img = new Tensor('float32', pixelData, imgDims);
+
         // convert to channel dimension format:
-        let imgDims = [image.height, image.width, image.channels];
-        let img = new Tensor('float32', pixelData, imgDims);
-        let transposed = transpose(img, [2, 0, 1]); // hwc -> chw
+        const transposed = transpose(img, [2, 0, 1]); // hwc -> chw
 
         return {
             original_size: [srcHeight, srcWidth],
@@ -248,22 +478,23 @@ export class ImageFeatureExtractor extends FeatureExtractor {
      * Calls the feature extraction process on an array of image
      * URLs, preprocesses each image, and concatenates the resulting
      * features into a single Tensor.
-     * @param {any} images The URL(s) of the image(s) to extract features from.
-     * @returns {Promise<Object>} An object containing the concatenated pixel values (and other metadata) of the preprocessed images.
+     * @param {any[]} images The URL(s) of the image(s) to extract features from.
+     * @param {...any} args Additional arguments.
+     * @returns {Promise<ImageFeatureExtractorResult>} An object containing the concatenated pixel values (and other metadata) of the preprocessed images.
      */
-    async _call(images) {
+    async _call(images, ...args) {
         if (!Array.isArray(images)) {
             images = [images];
         }
-
-        let imageData = await Promise.all(images.map(x => this.preprocess(x)));
+        /** @type {PreprocessedImage[]} */
+        const imageData = await Promise.all(images.map(x => this.preprocess(x)));
 
         // TODO:
 
         // Concatenate pixel values
         // TEMP: Add batch dimension so that concat works
         imageData.forEach(x => x.pixel_values.dims = [1, ...x.pixel_values.dims]);
-        let pixel_values = cat(imageData.map(x => x.pixel_values));
+        const pixel_values = cat(imageData.map(x => x.pixel_values));
 
         return {
             pixel_values: pixel_values,
@@ -278,8 +509,31 @@ export class ImageFeatureExtractor extends FeatureExtractor {
 
 }
 
+export class CLIPFeatureExtractor extends ImageFeatureExtractor { }
+export class ConvNextFeatureExtractor extends ImageFeatureExtractor { }
 export class ViTFeatureExtractor extends ImageFeatureExtractor { }
 export class MobileViTFeatureExtractor extends ImageFeatureExtractor { }
+export class DeiTFeatureExtractor extends ImageFeatureExtractor { }
+export class BeitFeatureExtractor extends ImageFeatureExtractor { }
+export class DonutFeatureExtractor extends ImageFeatureExtractor {
+    pad_image(pixelData, imgDims, padSize, options = {}) {
+        return super.pad_image(pixelData, imgDims, padSize, {
+            center: true,
+
+            // Since normalization is done after padding, we need to pad with -1.
+            // NOTE: This only works if `image_mean = 0.5` and `image_std = 0.5`.
+            // For more information, see https://github.com/huggingface/transformers/blob/main/src/transformers/models/donut/image_processing_donut.py#L433-L451
+            constant_values: -1,
+            ...options,
+        });
+    }
+}
+
+/**
+ * @typedef {object} DetrFeatureExtractorResultProps
+ * @property {Tensor} pixel_mask
+ * @typedef {ImageFeatureExtractorResult & DetrFeatureExtractorResultProps} DetrFeatureExtractorResult
+ */
 
 /**
  * Detr Feature Extractor.
@@ -288,40 +542,25 @@ export class MobileViTFeatureExtractor extends ImageFeatureExtractor { }
  */
 export class DetrFeatureExtractor extends ImageFeatureExtractor {
     /**
-     * Calls the feature extraction process on an array of image
-     * URLs, preprocesses each image, and concatenates the resulting
-     * features into a single Tensor.
-     * @param {any} urls The URL(s) of the image(s) to extract features from.
-     * @returns {Promise<Object>} An object containing the concatenated pixel values of the preprocessed images.
+     * Calls the feature extraction process on an array of image URLs, preprocesses
+     * each image, and concatenates the resulting features into a single Tensor.
+     * @param {any[]} urls The URL(s) of the image(s) to extract features from.
+     * @returns {Promise<DetrFeatureExtractorResult>} An object containing the concatenated pixel values of the preprocessed images.
      */
     async _call(urls) {
-        let result = await super._call(urls);
+        const result = await super._call(urls);
 
         // TODO support differently-sized images, for now assume all images are the same size.
         // TODO support different mask sizes (not just 64x64)
         // Currently, just fill pixel mask with 1s
-        let maskSize = [result.pixel_values.dims[0], 64, 64];
-        result.pixel_mask = new Tensor(
+        const maskSize = [result.pixel_values.dims[0], 64, 64];
+        const pixel_mask = new Tensor(
             'int64',
-            // TODO: fix error below
             new BigInt64Array(maskSize.reduce((a, b) => a * b)).fill(1n),
             maskSize
         );
 
-        return result;
-    }
-
-    /**
-     * @param {number[]} arr The URL(s) of the image(s) to extract features from.
-     * @returns {number[]} An object containing the concatenated pixel values of the preprocessed images.
-     */
-    center_to_corners_format([centerX, centerY, width, height]) {
-        return [
-            centerX - width / 2,
-            centerY - height / 2,
-            centerX + width / 2,
-            centerY + height / 2
-        ];
+        return { ...result, pixel_mask };
     }
 
     /**
@@ -331,59 +570,10 @@ export class DetrFeatureExtractor extends ImageFeatureExtractor {
      * @param {Tensor} outputs.pred_boxes The predicted boxes.
      * @return {Object[]} An array of objects containing the post-processed outputs.
      */
-    post_process_object_detection(outputs, threshold = 0.5, target_sizes = null) {
-        const out_logits = outputs.logits;
-        const out_bbox = outputs.pred_boxes;
-        const [batch_size, num_boxes, num_classes] = out_logits.dims;
 
-        if (target_sizes !== null && target_sizes.length !== batch_size) {
-            throw Error("Make sure that you pass in as many target sizes as the batch dimension of the logits")
-        }
-        let toReturn = [];
-        for (let i = 0; i < batch_size; ++i) {
-            let target_size = target_sizes !== null ? target_sizes[i] : null;
-            let info = {
-                boxes: [],
-                classes: [],
-                scores: []
-            }
-            let logits = out_logits[i];
-            let bbox = out_bbox[i];
-
-            for (let j = 0; j < num_boxes; ++j) {
-                let logit = logits[j];
-
-                // Get most probable class
-                let maxIndex = max(logit.data)[1];
-
-                if (maxIndex === num_classes - 1) {
-                    // This is the background class, skip it
-                    continue;
-                }
-
-                // Compute softmax over classes
-                let probs = softmax(logit.data);
-
-                let score = probs[maxIndex];
-                if (score > threshold) {
-                    // Some class has a high enough probability
-                    /** @type {number[]} */
-                    let box = bbox[j].data;
-
-                    // convert to [x0, y0, x1, y1] format
-                    box = this.center_to_corners_format(box)
-                    if (target_size !== null) {
-                        box = box.map((x, i) => x * target_size[(i + 1) % 2])
-                    }
-
-                    info.boxes.push(box);
-                    info.classes.push(maxIndex);
-                    info.scores.push(score);
-                }
-            }
-            toReturn.push(info);
-        }
-        return toReturn;
+    /** @type {post_process_object_detection} */
+    post_process_object_detection(...args) {
+        return post_process_object_detection(...args);
     }
 
     /**
@@ -663,7 +853,29 @@ export class DetrFeatureExtractor extends ImageFeatureExtractor {
     }
 }
 
+export class YolosFeatureExtractor extends ImageFeatureExtractor {
+    /** @type {post_process_object_detection} */
+    post_process_object_detection(...args) {
+        return post_process_object_detection(...args);
+    }
+}
+
+/**
+ * @typedef {object} SamImageProcessorResult
+ * @property {Tensor} pixel_values
+ * @property {HeightWidth[]} original_sizes
+ * @property {HeightWidth[]} reshaped_input_sizes
+ * @property {Tensor} input_points
+ */
+
 export class SamImageProcessor extends ImageFeatureExtractor {
+    /**
+     * @param {any[]} images The URL(s) of the image(s) to extract features from.
+     * @param {*} input_points A 3D or 4D array, representing the input points provided by the user.
+     * - 3D: `[point_batch_size, nb_points_per_image, 2]`. In this case, `batch_size` is assumed to be 1.
+     * - 4D: `[batch_size, point_batch_size, nb_points_per_image, 2]`.
+     * @returns {Promise<SamImageProcessorResult>}
+     */
     async _call(images, input_points) {
         let {
             pixel_values,
@@ -673,6 +885,7 @@ export class SamImageProcessor extends ImageFeatureExtractor {
 
         let shape = calculateDimensions(input_points);
 
+        // TODO: add support for 2D input_points
         if (shape.length === 3) {
             // Correct user's input
             shape = [1, ...shape];
@@ -791,6 +1004,26 @@ export class SamImageProcessor extends ImageFeatureExtractor {
     }
 }
 
+export class Swin2SRImageProcessor extends ImageFeatureExtractor {
+    pad_image(pixelData, imgDims, padSize, options = {}) {
+        // NOTE: In this case, `padSize` represents the size of the sliding window for the local attention.
+        // In other words, the image is padded so that its width and height are multiples of `padSize`.
+        const [imageWidth, imageHeight, imageChannels] = imgDims;
+
+        return super.pad_image(pixelData, imgDims, {
+            // NOTE: For Swin2SR models, the original python implementation adds padding even when the image's width/height is already
+            // a multiple of `pad_size`. However, this is most likely a bug (PR: https://github.com/mv-lab/swin2sr/pull/19).
+            // For this reason, we only add padding when the image's width/height is not a multiple of `pad_size`.
+            width: imageWidth + (padSize - imageWidth % padSize) % padSize,
+            height: imageHeight + (padSize - imageHeight % padSize) % padSize,
+        }, {
+            mode: 'symmetric',
+            center: false,
+            constant_values: -1,
+            ...options,
+        })
+    }
+}
 
 export class WhisperFeatureExtractor extends FeatureExtractor {
 
@@ -800,15 +1033,7 @@ export class WhisperFeatureExtractor extends FeatureExtractor {
         // Prefer given `mel_filters` from preprocessor_config.json, or calculate them if they don't exist.
         this.config.mel_filters ??= getMelFilters(this.config.sampling_rate, this.config.n_fft, this.config.feature_size);
     }
-    /**
-     * Calculates the index offset for a given index and window size.
-     * @param {number} i The index.
-     * @param {number} w The window size.
-     * @returns {number} The index offset.
-     */
-    calcOffset(i, w) {
-        return Math.abs((i + w) % (2 * w) - w);
-    }
+
 
     /**
      * Pads an array with a reflected version of itself on both ends.
@@ -826,11 +1051,11 @@ export class WhisperFeatureExtractor extends FeatureExtractor {
         }
 
         for (let i = 1; i <= left; ++i) {
-            padded[left - i] = array[this.calcOffset(i, w)];
+            padded[left - i] = array[calculateReflectOffset(i, w)];
         }
 
         for (let i = 1; i <= right; ++i) {
-            padded[w + left + i] = array[this.calcOffset(w - i, w)];
+            padded[w + left + i] = array[calculateReflectOffset(w - i, w)];
         }
 
         return padded;
@@ -1112,9 +1337,9 @@ export class WhisperFeatureExtractor extends FeatureExtractor {
 
     /**
      * Asynchronously extracts features from a given audio using the provided configuration.
-     * @param {Float32Array|Float64Array} audio The audio data as a Float32Array.
+     * @param {Float32Array|Float64Array} audio The audio data as a Float32Array/Float64Array.
      * @returns {Promise<{ input_features: Tensor }>} A Promise resolving to an object containing the extracted input features as a Tensor.
-    */
+     */
     async _call(audio) {
         if (!(audio instanceof Float32Array || audio instanceof Float64Array)) {
             throw new Error(
@@ -1144,6 +1369,56 @@ export class WhisperFeatureExtractor extends FeatureExtractor {
     }
 }
 
+export class Wav2Vec2FeatureExtractor extends FeatureExtractor {
+
+    /**
+     * @param {Float32Array} input_values 
+     * @returns {Float32Array} 
+     */
+    _zero_mean_unit_var_norm(input_values) {
+        // TODO support batch?
+        const sum = input_values.reduce((a, b) => a + b, 0);
+        const mean = sum / input_values.length;
+        const variance = input_values.reduce((a, b) => a + (b - mean) ** 2, 0) / input_values.length;
+        return input_values.map(x => (x - mean) / Math.sqrt(variance + 1e-7));
+    }
+
+    /**
+     * Asynchronously extracts features from a given audio using the provided configuration.
+     * @param {Float32Array|Float64Array} audio The audio data as a Float32Array/Float64Array.
+     * @returns {Promise<{ input_values: Tensor; attention_mask: Tensor }>} A Promise resolving to an object containing the extracted input features and attention mask as Tensors.
+     */
+    async _call(audio) {
+        // TODO: remove duplication
+        if (!(audio instanceof Float32Array || audio instanceof Float64Array)) {
+            throw new Error(
+                // @ts-ignore
+                `Wav2Vec2FeatureExtractor expects input to be a Float32Array or a Float64Array, but got ${audio?.constructor?.name ?? typeof audio} instead.` +
+                `If using the feature extractor directly, remember to use \`read_audio(url, sampling_rate)\` to obtain the raw audio data of the file/url.`
+            )
+        }
+        if (audio instanceof Float64Array) {
+            audio = new Float32Array(audio);
+        }
+
+        let input_values = audio;
+
+        // zero-mean and unit-variance normalization
+        if (this.config.do_normalize) {
+            input_values = this._zero_mean_unit_var_norm(input_values);
+        }
+
+        // TODO: allow user to pass in attention mask
+        const shape = [1, input_values.length];
+        return {
+            input_values: new Tensor('float32', input_values, shape),
+            attention_mask: new Tensor('int64', new BigInt64Array(input_values.length).fill(1n), shape)
+        };
+    }
+}
+
+export class SpeechT5FeatureExtractor extends FeatureExtractor { }
+
 /**
  * Represents a Processor that extracts features from an input.
  * @extends Callable
@@ -1162,15 +1437,20 @@ export class Processor extends Callable {
     /**
      * Calls the feature_extractor function with the given input.
      * @param {any} input The input to extract features from.
+     * @param {...any} args Additional arguments.
      * @returns {Promise<any>} A Promise that resolves with the extracted features.
      */
-    async _call(input) {
+    async _call(input, ...args) {
         return await this.feature_extractor(input);
     }
 }
 
 export class SamProcessor extends Processor {
-
+    /**
+     * @param {*} images 
+     * @param {*} input_points 
+     * @returns {Promise<any>}
+     */
     async _call(images, input_points) {
         return await this.feature_extractor(images, input_points);
     }
@@ -1199,10 +1479,31 @@ export class WhisperProcessor extends Processor {
     }
 }
 
+
+export class Wav2Vec2ProcessorWithLM extends Processor {
+    /**
+     * Calls the feature_extractor function with the given audio input.
+     * @param {any} audio The audio input to extract features from.
+     * @returns {Promise<any>} A Promise that resolves with the extracted features.
+     */
+    async _call(audio) {
+        return await this.feature_extractor(audio)
+    }
+}
+
+export class SpeechT5Processor extends Processor {
+    /**
+     * Calls the feature_extractor function with the given input.
+     * @param {any} input The input to extract features from.
+     * @returns {Promise<any>} A Promise that resolves with the extracted features.
+     */
+    async _call(input) {
+        return await this.feature_extractor(input)
+    }
+}
+
+
 //////////////////////////////////////////////////
-/**
- * @typedef {import('./utils/hub.js').PretrainedOptions} PretrainedOptions
- */
 /**
  * Helper class which is used to instantiate pretrained processors with the `from_pretrained` function.
  * The chosen processor class is determined by the type specified in the processor config.
@@ -1235,17 +1536,28 @@ export class WhisperProcessor extends Processor {
  */
 export class AutoProcessor {
     static FEATURE_EXTRACTOR_CLASS_MAPPING = {
-        'WhisperFeatureExtractor': WhisperFeatureExtractor,
-        'ViTFeatureExtractor': ViTFeatureExtractor,
-        'MobileViTFeatureExtractor': MobileViTFeatureExtractor,
-        'DetrFeatureExtractor': DetrFeatureExtractor,
+        WhisperFeatureExtractor,
+        ViTFeatureExtractor,
+        MobileViTFeatureExtractor,
+        CLIPFeatureExtractor,
+        ConvNextFeatureExtractor,
+        BeitFeatureExtractor,
+        DeiTFeatureExtractor,
+        DetrFeatureExtractor,
+        YolosFeatureExtractor,
+        DonutFeatureExtractor,
 
-        'SamImageProcessor': SamImageProcessor,
+        SamImageProcessor,
+        Swin2SRImageProcessor,
+        Wav2Vec2FeatureExtractor,
+        SpeechT5FeatureExtractor,
     }
 
     static PROCESSOR_CLASS_MAPPING = {
-        'WhisperProcessor': WhisperProcessor,
-        'SamProcessor': SamProcessor,
+        WhisperProcessor,
+        Wav2Vec2ProcessorWithLM,
+        SamProcessor,
+        SpeechT5Processor,
     }
 
     /**
@@ -1259,7 +1571,7 @@ export class AutoProcessor {
      *   Valid model ids can be located at the root-level, like `bert-base-uncased`, or namespaced under a
      *   user or organization name, like `dbmdz/bert-base-german-cased`.
      * - A path to a *directory* containing processor files, e.g., `./my_model_directory/`.
-     * @param {PretrainedOptions} options Additional options for loading the processor.
+     * @param {import('./utils/hub.js').PretrainedOptions} options Additional options for loading the processor.
      * 
      * @returns {Promise<Processor>} A new instance of the Processor class.
      */
@@ -1287,10 +1599,10 @@ export class AutoProcessor {
         if (!feature_extractor_class) {
             if (preprocessorConfig.size !== undefined) {
                 // Assume ImageFeatureExtractor
-                console.warn('Feature extractor type not specified, assuming ImageFeatureExtractor due to size parameter in config.');
+                console.warn(`Feature extractor type "${key}" not found, assuming ImageFeatureExtractor due to size parameter in config.`);
                 feature_extractor_class = ImageFeatureExtractor;
             } else {
-                throw new Error(`Unknown Feature Extractor type: ${preprocessorConfig.feature_extractor_type}`);
+                throw new Error(`Unknown Feature Extractor type: ${key}`);
             }
         }
 

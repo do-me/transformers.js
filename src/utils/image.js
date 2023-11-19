@@ -8,7 +8,6 @@
  * @module utils/image
  */
 
-import fs from 'fs';
 import { isString } from './core.js';
 import { getFile } from './hub.js';
 import { env } from '../env.js';
@@ -65,17 +64,17 @@ const RESAMPLING_MAPPING = {
     5: 'hamming',
 }
 
-export class RawImage {
+/**
+ * Mapping from file extensions to MIME types.
+ */
+const CONTENT_TYPE_MAP = new Map([
+    ['png', 'image/png'],
+    ['jpg', 'image/jpeg'],
+    ['jpeg', 'image/jpeg'],
+    ['gif', 'image/gif'],
+]);
 
-    /**
-     * Mapping from file extensions to MIME types.
-     */
-    _CONTENT_TYPE_MAP = {
-        'png': 'image/png',
-        'jpg': 'image/jpeg',
-        'jpeg': 'image/jpeg',
-        'gif': 'image/gif',
-    }
+export class RawImage {
 
     /**
      * Create a new `RawImage` object.
@@ -85,7 +84,10 @@ export class RawImage {
      * @param {1|2|3|4} channels The number of channels.
      */
     constructor(data, width, height, channels) {
-        this._update(data, width, height, channels);
+        this.data = data;
+        this.width = width;
+        this.height = height;
+        this.channels = channels;
     }
 
     /**
@@ -96,7 +98,7 @@ export class RawImage {
      * **Example:** Read image from a URL.
      * ```javascript
      * let image = await RawImage.read('https://huggingface.co/datasets/Xenova/transformers.js-docs/resolve/main/football-match.jpg');
-     * // test {
+     * // RawImage {
      * //   "data": Uint8ClampedArray [ 25, 25, 25, 19, 19, 19, ... ],
      * //   "width": 800,
      * //   "height": 533,
@@ -152,6 +154,21 @@ export class RawImage {
 
             return await loadImageFunction(img);
         }
+    }
+
+    /**
+     * Helper method to create a new Image from a tensor
+     * @param {import('./tensor.js').Tensor} tensor 
+     */
+    static fromTensor(tensor, channel_format = 'CHW') {
+        if (channel_format === 'CHW') {
+            tensor = tensor.transpose(1, 2, 0);
+        } else if (channel_format === 'HWC') {
+            // Do nothing
+        } else {
+            throw new Error(`Unsupported channel format: ${channel_format}`);
+        }
+        return new RawImage(tensor.data, tensor.dims[1], tensor.dims[0], tensor.dims[2]);
     }
 
     /**
@@ -509,7 +526,8 @@ export class RawImage {
      * @param {Uint8ClampedArray} data The new image data.
      * @param {number} width The new width of the image.
      * @param {number} height The new height of the image.
-     * @param {1|2|3|4} channels The new number of channels of the image.
+     * @param {1|2|3|4|null} [channels] The new number of channels of the image.
+     * @private
      */
     _update(data, width, height, channels = null) {
         this.data = data;
@@ -561,7 +579,7 @@ export class RawImage {
 
         if (BROWSER_ENV) {
             const extension = path.split('.').pop().toLowerCase();
-            const mime = this._CONTENT_TYPE_MAP[extension] ?? 'image/png';
+            const mime = CONTENT_TYPE_MAP.get(extension) ?? 'image/png';
 
             // Convert image to canvas
             const canvas = this.toCanvas();

@@ -19,17 +19,17 @@ if (!globalThis.ReadableStream) {
 
 /**
  * @typedef {Object} PretrainedOptions Options for loading a pretrained model.     
- * @property {boolean?} [options.quantized=true] Whether to load the 8-bit quantized version of the model (only applicable when loading model files).
- * @property {function} [options.progress_callback=null] If specified, this function will be called during model construction, to provide the user with progress updates.
- * @property {Object} [options.config=null] Configuration for the model to use instead of an automatically loaded configuration. Configuration can be automatically loaded when:
+ * @property {boolean?} [quantized=true] Whether to load the 8-bit quantized version of the model (only applicable when loading model files).
+ * @property {function} [progress_callback=null] If specified, this function will be called during model construction, to provide the user with progress updates.
+ * @property {Object} [config=null] Configuration for the model to use instead of an automatically loaded configuration. Configuration can be automatically loaded when:
  * - The model is a model provided by the library (loaded with the *model id* string of a pretrained model).
  * - The model is loaded by supplying a local directory as `pretrained_model_name_or_path` and a configuration JSON file named *config.json* is found in the directory.
- * @property {string} [options.cache_dir=null] Path to a directory in which a downloaded pretrained model configuration should be cached if the standard cache should not be used.
- * @property {boolean} [options.local_files_only=false] Whether or not to only look at local files (e.g., not try downloading the model).
- * @property {string} [options.revision='main'] The specific model version to use. It can be a branch name, a tag name, or a commit id,
+ * @property {string} [cache_dir=null] Path to a directory in which a downloaded pretrained model configuration should be cached if the standard cache should not be used.
+ * @property {boolean} [local_files_only=false] Whether or not to only look at local files (e.g., not try downloading the model).
+ * @property {string} [revision='main'] The specific model version to use. It can be a branch name, a tag name, or a commit id,
  * since we use a git-based system for storing models and other artifacts on huggingface.co, so `revision` can be any identifier allowed by git.
  * NOTE: This setting is ignored for local requests.
- * @property {string} [options.model_file_name=null] If specified, load the model with this name (excluding the .onnx suffix). Currently only valid for encoder- or decoder-only models.
+ * @property {string} [model_file_name=null] If specified, load the model with this name (excluding the .onnx suffix). Currently only valid for encoder- or decoder-only models.
  */
 
 class FileResponse {
@@ -410,8 +410,8 @@ export async function getModelFile(path_or_repo_id, filename, fatal = true, opti
     let cacheKey;
     let proposedCacheKey = cache instanceof FileCache ? fsCacheKey : remoteURL;
 
-    /** @type {Response|undefined} */
-    let responseToCache;
+    // Whether to cache the final response in the end.
+    let toCacheResponse = false;
 
     /** @type {Response|FileResponse|undefined} */
     let response;
@@ -423,6 +423,8 @@ export async function getModelFile(path_or_repo_id, filename, fatal = true, opti
         //  2. If no response is found, we try to get from cache using the remote URL or file system cache.
         response = await tryCache(cache, localPath, proposedCacheKey);
     }
+
+    const cacheHit = response !== undefined;
 
     if (response === undefined) {
         // Caching not available, or file is not cached, so we perform the request
@@ -475,13 +477,13 @@ export async function getModelFile(path_or_repo_id, filename, fatal = true, opti
             cacheKey = proposedCacheKey;
         }
 
-
-        if (cache && response instanceof Response && response.status === 200) {
-            // only clone if cache available, and response is valid
-            responseToCache = response.clone();
-        }
+        // Only cache the response if:
+        toCacheResponse =
+            cache                              // 1. A caching system is available
+            && typeof Response !== 'undefined' // 2. `Response` is defined (i.e., we are in a browser-like environment)
+            && response instanceof Response    // 3. result is a `Response` object (i.e., not a `FileResponse`)
+            && response.status === 200         // 4. request was successful (status code 200)
     }
-
 
     // Start downloading
     dispatchCallback(options.progress_callback, {
@@ -490,25 +492,57 @@ export async function getModelFile(path_or_repo_id, filename, fatal = true, opti
         file: filename
     })
 
-    const buffer = await readResponse(response, data => {
-        dispatchCallback(options.progress_callback, {
-            status: 'progress',
-            ...data,
-            name: path_or_repo_id,
-            file: filename
-        })
-    })
+    const progressInfo = {
+        status: 'progress',
+        name: path_or_repo_id,
+        file: filename
+    }
 
+    /** @type {Uint8Array} */
+    let buffer;
+
+    if (!options.progress_callback) {
+        // If no progress callback is specified, we can use the `.arrayBuffer()`
+        // method to read the response.
+        buffer = new Uint8Array(await response.arrayBuffer());
+
+    } else if (
+        cacheHit // The item is being read from the cache
+        &&
+        typeof navigator !== 'undefined' && /firefox/i.test(navigator.userAgent) // We are in Firefox
+    ) {
+        // Due to bug in Firefox, we cannot display progress when loading from cache.
+        // Fortunately, since this should be instantaneous, this should not impact users too much.
+        buffer = new Uint8Array(await response.arrayBuffer());
+
+        // For completeness, we still fire the final progress callback
+        dispatchCallback(options.progress_callback, {
+            ...progressInfo,
+            progress: 100,
+            loaded: buffer.length,
+            total: buffer.length,
+        })
+    } else {
+        buffer = await readResponse(response, data => {
+            dispatchCallback(options.progress_callback, {
+                ...progressInfo,
+                ...data,
+            })
+        })
+    }
 
     if (
         // Only cache web responses
         // i.e., do not cache FileResponses (prevents duplication)
-        responseToCache && cacheKey
+        toCacheResponse && cacheKey
         &&
         // Check again whether request is in cache. If not, we add the response to the cache
         (await cache.match(cacheKey) === undefined)
     ) {
-        await cache.put(cacheKey, responseToCache)
+        // NOTE: We use `new Response(buffer, ...)` instead of `response.clone()` to handle LFS files
+        await cache.put(cacheKey, new Response(buffer, {
+            headers: response.headers
+        }))
             .catch(err => {
                 // Do not crash if unable to add to cache (e.g., QuotaExceededError).
                 // Rather, log a warning and proceed with execution.
@@ -557,7 +591,6 @@ export async function getModelJSON(modelPath, fileName, fatal = true, options = 
  * @returns {Promise<Uint8Array>} A Promise that resolves with the Uint8Array buffer
  */
 async function readResponse(response, progress_callback) {
-    // Read and track progress when reading a Response object
 
     const contentLength = response.headers.get('Content-Length');
     if (contentLength === null) {

@@ -17,10 +17,13 @@ README_TEMPLATE = """
         <img alt="NPM" src="https://img.shields.io/npm/v/@xenova/transformers">
     </a>
     <a href="https://www.npmjs.com/package/@xenova/transformers">
-        <img alt="Downloads" src="https://img.shields.io/npm/dw/@xenova/transformers">
+        <img alt="NPM Downloads" src="https://img.shields.io/npm/dw/@xenova/transformers">
+    </a>
+    <a href="https://www.jsdelivr.com/package/npm/@xenova/transformers">
+        <img alt="jsDelivr Hits" src="https://img.shields.io/jsdelivr/npm/hw/@xenova/transformers">
     </a>
     <a href="https://github.com/xenova/transformers.js/blob/main/LICENSE">
-        <img alt="License" src="https://img.shields.io/github/license/xenova/transformers.js">
+        <img alt="License" src="https://img.shields.io/github/license/xenova/transformers.js?color=blue">
     </a>
     <a href="https://huggingface.co/docs/transformers.js/index">
         <img alt="Documentation" src="https://img.shields.io/website/http/huggingface.co/docs/transformers.js/index.svg?down_color=red&down_message=offline&up_message=online">
@@ -70,15 +73,16 @@ FILES_TO_INCLUDE = dict(
     models='./docs/snippets/6_supported-models.snippet',
 )
 
+DOCS_BASE_URL = 'https://huggingface.co/docs/transformers.js'
+
 # Map of custom links to replace, typically used for links to other sections of the README.
 CUSTOM_LINK_MAP = {
     '/custom_usage#convert-your-models-to-onnx': '#convert-your-models-to-onnx',
+    './api/env': DOCS_BASE_URL + '/api/env',
 }
 
 
 def main():
-
-    DOCS_BASE_URL = 'https://huggingface.co/docs/transformers.js'
 
     file_data = {}
     for key, file_path in FILES_TO_INCLUDE.items():
