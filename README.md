@@ -155,23 +155,11 @@ For a full list of available settings, check out the [API Reference](https://hug
 
 We recommend using our [conversion script](https://github.com/xenova/transformers.js/blob/main/scripts/convert.py) to convert your PyTorch, TensorFlow, or JAX models to ONNX in a single command. Behind the scenes, it uses [🤗 Optimum](https://huggingface.co/docs/optimum) to perform conversion and quantization of your model.
 
-Assuming you have Python 3 installed, create a virtual environment `onnxconversion` with all dependencies:
-
-```bash
-python -m venv onnxconversion
-source onnxconversion/bin/activate
-python -m pip install -r scripts/requirements.txt
-```
-
-Then use our script to convert the model:
-
 ```bash
 python -m scripts.convert --quantize --model_id <model_name_or_path>
 ```
-According to the 🤗 URL, `model_name_or_path` can be in the format `<user>/<model>` e.g. `intfloat/multilingual-e5-small` for https://huggingface.co/intfloat/multilingual-e5-small or for certain models just `<model>` e.g. `bert-base-uncased` for https://huggingface.co/bert-base-uncased.
 
 For example, convert and quantize [bert-base-uncased](https://huggingface.co/bert-base-uncased) using:
-
 ```bash
 python -m scripts.convert --quantize --model_id bert-base-uncased
 ```
@@ -187,6 +175,7 @@ bert-base-uncased/
     ├── model.onnx
     └── model_quantized.onnx
 ```
+
 
 ## Supported tasks/models
 
@@ -327,5 +316,4 @@ You can refine your search by selecting the task you're interested in (e.g., [te
 1. **[XLM](https://huggingface.co/docs/transformers/model_doc/xlm)** (from Facebook) released together with the paper [Cross-lingual Language Model Pretraining](https://arxiv.org/abs/1901.07291) by Guillaume Lample and Alexis Conneau.
 1. **[XLM-RoBERTa](https://huggingface.co/docs/transformers/model_doc/xlm-roberta)** (from Facebook AI), released together with the paper [Unsupervised Cross-lingual Representation Learning at Scale](https://arxiv.org/abs/1911.02116) by Alexis Conneau*, Kartikay Khandelwal*, Naman Goyal, Vishrav Chaudhary, Guillaume Wenzek, Francisco Guzmán, Edouard Grave, Myle Ott, Luke Zettlemoyer and Veselin Stoyanov.
 1. **[YOLOS](https://huggingface.co/docs/transformers/model_doc/yolos)** (from Huazhong University of Science & Technology) released with the paper [You Only Look at One Sequence: Rethinking Transformer in Vision through Object Detection](https://arxiv.org/abs/2106.00666) by Yuxin Fang, Bencheng Liao, Xinggang Wang, Jiemin Fang, Jiyang Qi, Rui Wu, Jianwei Niu, Wenyu Liu.
-
 
